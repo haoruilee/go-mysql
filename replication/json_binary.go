@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
-	. "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/pingcap/errors"
+	"github.com/juju/errors"
+	. "github.com/siddontang/go-mysql/mysql"
 	"github.com/siddontang/go/hack"
 )
 
@@ -76,10 +76,7 @@ func (e *RowsEvent) decodeJsonBinary(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return []byte{}, nil
 	}
-	d := jsonBinaryDecoder{
-		useDecimal:      e.useDecimal,
-		ignoreDecodeErr: e.ignoreJSONDecodeErr,
-	}
+	d := jsonBinaryDecoder{useDecimal: e.useDecimal}
 
 	if d.isDataShort(data, 1) {
 		return nil, d.err
@@ -94,9 +91,8 @@ func (e *RowsEvent) decodeJsonBinary(data []byte) ([]byte, error) {
 }
 
 type jsonBinaryDecoder struct {
-	useDecimal      bool
-	ignoreDecodeErr bool
-	err             error
+	useDecimal bool
+	err        error
 }
 
 func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) interface{} {
@@ -149,14 +145,7 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 	count := d.decodeCount(data, isSmall)
 	size := d.decodeCount(data[offsetSize:], isSmall)
 
-	if d.isDataShort(data, size) {
-		// Before MySQL 5.7.22, json type generated column may have invalid value,
-		// bug ref: https://bugs.mysql.com/bug.php?id=88791
-		// As generated column value is not used in replication, we can just ignore
-		// this error and return a dummy value for this column.
-		if d.ignoreDecodeErr {
-			d.err = nil
-		}
+	if d.isDataShort(data, int(size)) {
 		return nil
 	}
 
@@ -452,6 +441,7 @@ func (d *jsonBinaryDecoder) decodeDateTime(data []byte) interface{} {
 	frac := v % (1 << 24)
 
 	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d", year, month, day, hour, minute, second, frac)
+
 }
 
 func (d *jsonBinaryDecoder) decodeCount(data []byte, isSmall bool) int {
@@ -479,7 +469,7 @@ func (d *jsonBinaryDecoder) decodeVariableLength(data []byte) (int, int) {
 
 		if v&0x80 == 0 {
 			if length > math.MaxUint32 {
-				d.err = errors.Errorf("variable length %d must <= %d", length, int64(math.MaxUint32))
+				d.err = errors.Errorf("variable length %d must <= %d", length, uint32(math.MaxUint32))
 				return 0, 0
 			}
 
@@ -493,3 +483,179 @@ func (d *jsonBinaryDecoder) decodeVariableLength(data []byte) (int, int) {
 
 	return 0, 0
 }
+ jsonbSmallOffsetSize
+	jsonbKeyEntrySizeLarge = 2 + jsonbLargeOffsetSize
+
+	jsonbValueEntrySizeSmall = 1 + jsonbSmallOffsetSize
+	jsonbValueEntrySizeLarge = 1 + jsonbLargeOffsetSize
+)
+
+func jsonbGetOffsetSize(isSmall bool) int {
+	if isSmall {
+		return jsonbSmallOffsetSize
+	}
+
+	return jsonbLargeOffsetSize
+}
+
+func jsonbGetKeyEntrySize(isSmall bool) int {
+	if isSmall {
+		return jsonbKeyEntrySizeSmall
+	}
+
+	return jsonbKeyEntrySizeLarge
+}
+
+func jsonbGetValueEntrySize(isSmall bool) int {
+	if isSmall {
+		return jsonbValueEntrySizeSmall
+	}
+
+	return jsonbValueEntrySizeLarge
+}
+
+// decodeJsonBinary decodes the JSON binary encoding data and returns
+// the common JSON encoding data.
+func (e *RowsEvent) decodeJsonBinary(data []byte) ([]byte, error) {
+	// Sometimes, we can insert a NULL JSON even we set the JSON field as NOT NULL.
+	// If we meet this case, we can return an empty slice.
+	if len(data) == 0 {
+		return []byte{}, nil
+	}
+	d := jsonBinaryDecoder{
+		useDecimal:      e.useDecimal,
+		ignoreDecodeErr: e.ignoreJSONDecodeErr,
+	}
+
+	if d.isDataShort(data, 1) {
+		return nil, d.err
+	}
+
+	v := d.decodeValue(data[0], data[1:])
+	if d.err != nil {
+		return nil, d.err
+	}
+
+	return json.Marshal(v)
+}
+
+type jsonBinaryDecoder struct {
+	useDecimal      bool
+	ignoreDecodeErr bool
+	err             error
+}
+
+func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) interface{} {
+	if d.err != nil {
+		return nil
+	}
+
+	switch tp {
+	case JSONB_SMALL_OBJECT:
+		return d.decodeObjectOrArray(data, true, true)
+	case JSONB_LARGE_OBJECT:
+		return d.decodeObjectOrArray(data, false, true)
+	case JSONB_SMALL_ARRAY:
+		return d.decodeObjectOrArray(data, true, false)
+	case JSONB_LARGE_ARRAY:
+		return d.decodeObjectOrArray(data, false, false)
+	case JSONB_LITERAL:
+		return d.decodeLiteral(data)
+	case JSONB_INT16:
+		return d.decodeInt16(data)
+	case JSONB_UINT16:
+		return d.decodeUint16(data)
+	case JSONB_INT32:
+		return d.decodeInt32(data)
+	case JSONB_UINT32:
+		return d.decodeUint32(data)
+	case JSONB_INT64:
+		return d.decodeInt64(data)
+	case JSONB_UINT64:
+		return d.decodeUint64(data)
+	case JSONB_DOUBLE:
+		return d.decodeDouble(data)
+	case JSONB_STRING:
+		return d.decodeString(data)
+	case JSONB_OPAQUE:
+		return d.decodeOpaque(data)
+	default:
+		d.err = errors.Errorf("invalid json type %d", tp)
+	}
+
+	return nil
+}
+
+func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObject bool) interface{} {
+	offsetSize := jsonbGetOffsetSize(isSmall)
+	if d.isDataShort(data, 2*offsetSize) {
+		return nil
+	}
+
+	count := d.decodeCount(data, isSmall)
+	size := d.decodeCount(data[offsetSize:], isSmall)
+
+	if d.isDataShort(data, size) {
+		// Before MySQL 5.7.22, json type generated column may have invalid value,
+		// bug ref: https://bugs.mysql.com/bug.php?id=88791
+		// As generated column value is not used in replication, we can just ignore
+		// this error and return a dummy value for this column.
+		if d.ignoreDecodeErr {
+			d.err = nil
+		}
+		return nil
+	}
+
+	keyEntrySize := jsonbGetKeyEntrySize(isSmall)
+	valueEntrySize := jsonbGetValueEntrySize(isSmall)
+
+	headerSize := 2*offsetSize + count*valueEntrySize
+
+	if isObject {
+		headerSize += count * keyEntrySize
+	}
+
+	if headerSize > size {
+		d.err = errors.Errorf("header size %d > size %d", headerSize, size)
+		return nil
+	}
+
+	var keys []string
+	if isObject {
+		keys = make([]string, count)
+		for i := 0; i < count; i++ {
+			// decode key
+			entryOffset := 2*offsetSize + keyEntrySize*i
+			keyOffset := d.decodeCount(data[entryOffset:], isSmall)
+			keyLength := int(d.decodeUint16(data[entryOffset+offsetSize:]))
+
+			// Key must start after value entry
+			if keyOffset < headerSize {
+				d.err = errors.Errorf("invalid key offset %d, must > %d", keyOffset, headerSize)
+				return nil
+			}
+
+			if d.isDataShort(data, keyOffset+keyLength) {
+				return nil
+			}
+
+			keys[i] = hack.String(data[keyOffset : keyOffset+keyLength])
+		}
+	}
+
+	if d.err != nil {
+		return nil
+	}
+
+	values := make([]interface{}, count)
+	for i := 0; i < count; i++ {
+		// decode value
+		entryOffset := 2*offsetSize + valueEntrySize*i
+		if isObject {
+			entryOffset += keyEntrySize * count
+		}
+
+		tp := data[entryOffset]
+
+		if isInlineValue(tp, isSmall) {
+			values[i] = d.decodeValue(tp, data[entryOffset+1:entryOffset+valueEntrySize
